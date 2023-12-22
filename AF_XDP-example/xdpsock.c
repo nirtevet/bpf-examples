@@ -1225,7 +1225,7 @@ static u16 ophir_rx_only(u16 xsk_id,
         }
         return 0;
     }
-	printf("222\n");
+	//printf("222\n");
     // Determine the number of packets to process, capped by the array size or the received count
     wanted_num_of_packets = array_size < rcvd ? array_size : rcvd;
 
@@ -1249,7 +1249,7 @@ static u16 ophir_rx_only(u16 xsk_id,
         rx_array[i].option = desc->options;
 	}
 
-    printf("333\n");
+    ///printf("333\n");
     // Update statistics
     xsk->ring_stats.rx_npkts += eop_cnt;
     xsk->ring_stats.rx_frags += rcvd;
@@ -1922,7 +1922,7 @@ int xdp_init(int num_of_xsks, char* interface_name)
 	//xsk_populate_fill_ring(umem);
 	
 	for (i = 0; i < opt_num_xsks; i++){
-		// xsks[i] = xsk_configure_socket(umem, rx, tx);
+		//xsks[num_socks++] = xsk_configure_socket(umem, rx, tx);
 		xsks[num_socks++] = xsk_configure_socket_multicore(umem, rx, tx, i);
 		printf("\n\n xsks = 0x%llx", xsks[i]);
 	}
