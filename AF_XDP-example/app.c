@@ -14,7 +14,8 @@
 //#include <linux/ip.h> // For csum_replace2
 #include <stdint.h>
 
-uint16_t checksum(u16 *data, int len) {
+
+inline uint16_t checksum(u16 *data, int len) {
   uint32_t sum = 0;
   int i;
 
@@ -39,7 +40,7 @@ uint16_t checksum(u16 *data, int len) {
 void answer_ping(void* pkt, u32 len);
 
 #define USER_FUNC answer_ping_V4
-#define PKT_ARRAY_SIZE 32
+#define PKT_ARRAY_SIZE 128
 
 static inline __sum16 csum16_add(__sum16 csum, __be16 addend) {
     uint16_t res = (__u16)csum;
@@ -57,54 +58,7 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
-static void hex_dump2(void *pkt, size_t length)
-{
-	const unsigned char *address = (unsigned char *)pkt;
-	const unsigned char *line = address;
-	size_t line_size = 32;
-	unsigned char c;
-	char buf[32];
-	int i = 0;
-
-	//sprintf(buf, "addr=%llu", addr);
-	printf("length = %zu\n", length);
-	printf("%s | ", buf);
-	while (length-- > 0) {
-		printf("%02X ", *address++);
-		if (!(++i % line_size) || (length == 0 && i % line_size)) {
-			if (length == 0) {
-				while (i++ % line_size)
-					printf("__ ");
-			}
-			printf(" | ");	/* right close */
-			while (line < address) {
-				c = *line++;
-				printf("%c", (c < 33 || c == 255) ? 0x2E : c);
-			}
-			printf("\n");
-			if (length > 0)
-				printf("%s | ", buf);
-		}
-	}
-	printf("\n");
-}
-
-
-static void swap_mac_addresses_and_edit_data(void *data)
-{
-    //printf("\n inside our app swap \n");
-	struct ether_header *eth = (struct ether_header *)data;
-	struct ether_addr *src_addr = (struct ether_addr *)&eth->ether_shost;
-	struct ether_addr *dst_addr = (struct ether_addr *)&eth->ether_dhost;
-	struct ether_addr tmp;
-
-	tmp = *src_addr;
-	*src_addr = *dst_addr;
-	*dst_addr = tmp;
-}
-
-struct packet_desc answer_ping_V4(struct packet_desc pkt_desc){
-    int ret;
+inline struct packet_desc answer_ping_V4(struct packet_desc pkt_desc){
     uint8_t tmp_mac[ETH_ALEN];
     struct ethhdr *eth = (struct ethhdr *) pkt_desc.addr;
     struct iphdr *ipv4 = (struct iphdr *) (eth + 1);
@@ -114,7 +68,7 @@ struct packet_desc answer_ping_V4(struct packet_desc pkt_desc){
         pkt_desc.len < (sizeof(*eth) + sizeof(*ipv4) + sizeof(*icmp)) ||
         ipv4->protocol != IPPROTO_ICMP ||
         icmp->type != ICMP_ECHO)
-        return;
+        return pkt_desc;
 
     memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
     memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
@@ -123,9 +77,9 @@ struct packet_desc answer_ping_V4(struct packet_desc pkt_desc){
     uint32_t tmp_ip = ipv4->saddr;
     ipv4->saddr = ipv4->daddr;
     ipv4->daddr = tmp_ip;
-    __u32 *data_ptr = (__u32 *)((__u8 *)icmp + sizeof(struct icmphdr));
+    // __u32 *data_ptr = (__u32 *)((__u8 *)icmp + sizeof(struct icmphdr));
     if (pkt_desc.len >= sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct icmphdr) + 4) {
-            __u32 *data_ptr = (__u32 *)((__u8 *)icmp + sizeof(struct icmphdr));
+            // __u32 *data_ptr = (__u32 *)((__u8 *)icmp + sizeof(struct icmphdr));
             // (*data_ptr) = htonl(ntohl(*data_ptr) + 1);
             //icmp->checksum = 0;
         }
@@ -134,34 +88,11 @@ struct packet_desc answer_ping_V4(struct packet_desc pkt_desc){
 
     // Recompute the ICMP checksum
     icmp->checksum = 0;
-    icmp->checksum = (checksum((u16*)icmp, pkt_desc.len - sizeof(struct ethhdr) - sizeof(struct iphdr) - 4));
-    //icmp->checksum = ntohs(checksum((u16*)ipv4, pkt_desc.len - sizeof(struct ethhdr) - 4));
-    //printf("answer ping: %d\n", sizeof(struct ethhdr));
-    // csum_replace2(&icmp->checksum,
-    //         htons(ICMP_ECHO << 8),
-    //         htons(ICMP_ECHOREPLY << 8));
-    // printf("\n\nhex dump2:\n");
-    // hex_dump2(pkt_desc.addr, pkt_desc.len);
+    icmp->checksum = htons(checksum((u16*)icmp, pkt_desc.len - sizeof(struct ethhdr) - sizeof(struct iphdr)));
+
     return pkt_desc;
 }
-/*
-// Function to create an ICMP Echo Request packet
-void createPingPacket(int seqNum, char *packet, int packetSize) {
-    // ICMP header
-    struct icmphdr *icmp = (struct icmphdr *)packet;
-    icmp->type = ICMP_ECHO;
-    icmp->code = 0;
-    icmp->un.echo.id = getpid();
-    icmp->un.echo.sequence = seqNum;
 
-    // Fill the rest of the packet with arbitrary data
-    memset(packet + sizeof(struct icmphdr), 0xa5, packetSize - sizeof(struct icmphdr));
-
-    // Calculate ICMP checksum
-    icmp->checksum = 0;
-    icmp->checksum = checksum((unsigned short *)icmp, packetSize);
-}
-*/
 void print_packet_desc_array(const struct packet_desc *arr, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         printf("Packet %zu:\n", i + 1);
@@ -181,111 +112,107 @@ void print_packet_desc_array(const struct packet_desc *arr, size_t size) {
     }
 }
 
-int main(){
+void generate_packets(struct packet_desc* pkt_desc_array_tx, int xsk_id){
+    int tx_cnt = 0;
+	unsigned long next_tx_ns = 0;
+    unsigned long tx_ns = 0;
+	struct timespec next;
+    long diff;
+    gen_eth_hdr_data();
+
+	for (int i = 0; i < NUM_FRAMES; i++){
+        gen_eth_frame(xsk_id, i * opt_xsk_frame_size);
+	}
+    	/* Measure periodic Tx scheduling variance */
+    tx_ns = get_nsecs();
+    diff = tx_ns - next_tx_ns;
+    if (diff < tx_cycle_diff_min)
+        tx_cycle_diff_min = diff;
+
+    if (diff > tx_cycle_diff_max)
+        tx_cycle_diff_max = diff;
+
+    tx_cycle_diff_ave += (double)diff;
+    tx_cycle_cnt++;
+
+    tx_only(xsk_id, 2048, tx_ns);
+
     
-    int number_of_sockets = 1;
-    char* interface_name = "enp3s0f0";
-    signal(SIGINT, int_exit);
-	signal(SIGTERM, int_exit);
-	signal(SIGABRT, int_exit);
+    // for(int i=0; i < PKT_ARRAY_SIZE; i++){
+    //     gen_eth_frame(xsk_id, frame_number, &pkt_desc_array_tx[i]);
+    //     frame_number++;
+    // }
 
-    xdp_init(number_of_sockets, interface_name);
-    struct packet_desc pkt_desc_array_rx[PKT_ARRAY_SIZE];
-    struct packet_desc pkt_desc_array_tx[PKT_ARRAY_SIZE];
-    if(!pkt_desc_array_rx || !pkt_desc_array_tx){
-        return -1;
-    }
-
-    while(__glibc_likely(1)){
-        int pkt_cnt = ophir_rx_only(0, pkt_desc_array_rx, PKT_ARRAY_SIZE);
-        if(!pkt_cnt){
-            continue;
-        }
-
-        for(int i=0; i< pkt_cnt; i++){
-            struct packet_desc tmp_desc = answer_ping_V4(pkt_desc_array_rx[i]);
-            pkt_desc_array_tx[i] = tmp_desc;
-        }
-
-        int ret = ophir_tx_only(0,pkt_desc_array_tx, PKT_ARRAY_SIZE, pkt_cnt);
-
-
-    }
-    xdp_exit();
-
-
-return 0;
 }
+
 
 void work(void* args){
     int* xsk_id = (int*)args;
     struct packet_desc pkt_desc_array_rx[PKT_ARRAY_SIZE];
     struct packet_desc pkt_desc_array_tx[PKT_ARRAY_SIZE];
-    if(!pkt_desc_array_rx || !pkt_desc_array_tx){
-        return -1;
-    }
 
     while(__glibc_likely(1)){
-        int pkt_cnt = ophir_rx_only(*xsk_id, pkt_desc_array_rx, PKT_ARRAY_SIZE);
+        int pkt_cnt = fill_rx_array(*xsk_id, pkt_desc_array_rx, PKT_ARRAY_SIZE);
         if(!pkt_cnt){
             continue;
         }
-
         for(int i=0; i< pkt_cnt; i++){
-            printf("\nping: \n");
-            hex_dump2(pkt_desc_array_rx[i].addr, pkt_desc_array_rx[i].len);
             struct packet_desc tmp_desc = answer_ping_V4(pkt_desc_array_rx[i]);
             
-            printf("\nping_reply: \n");
-            hex_dump2(tmp_desc.addr, tmp_desc.len);
             pkt_desc_array_tx[i] = tmp_desc;
         }
 
-        int ret = ophir_tx_only(*xsk_id, pkt_desc_array_tx, PKT_ARRAY_SIZE, pkt_cnt);
-        printf("main: xsk number %d\n", *xsk_id);
+        send_tx_array(*xsk_id, pkt_desc_array_tx, PKT_ARRAY_SIZE, pkt_cnt);
 
     }
 }
 
-// int main()
-// {    
-//     int number_of_sockets = 4;
-//     char* interface_name = "enp3s0f0";
-//     opt_num_xsks = number_of_sockets;
-//     signal(SIGINT, int_exit);
-// 	signal(SIGTERM, int_exit);
-// 	signal(SIGABRT, int_exit);
+void work_tx(void* args){
+    int* xsk_id = (int*)args;
+    struct packet_desc pkt_desc_array_rx[PKT_ARRAY_SIZE];
+    struct packet_desc pkt_desc_array_tx[PKT_ARRAY_SIZE];
 
-//     xdp_init(number_of_sockets, interface_name);
-//     pthread_t sockets[number_of_sockets];
-//     int id[number_of_sockets];
-//     for(int i=0; i<number_of_sockets; i++){
-//         id[i] = i;
-//         pthread_create(&sockets[i], NULL, work, (void*)&id[i]);
-//     }
+    while(__glibc_likely(1)){
+        generate_packets(pkt_desc_array_tx, *xsk_id);
 
-//     // Wait for the threads to finish
-//     for(int i=0; i<number_of_sockets; i++){
-//         pthread_join(sockets[i], NULL);
-//     }
+        // send_tx_array(*xsk_id, pkt_desc_array_tx, PKT_ARRAY_SIZE, PKT_ARRAY_SIZE);
 
-//     xdp_exit();
+    }
+}
 
-//     return 0;
-// }
+int main()
+{    
+    int number_of_sockets = 16;
+    char* interface_name = "enp3s0f0";
+    pthread_t threads[number_of_sockets];
+    opt_num_xsks = number_of_sockets;
+    signal(SIGINT, int_exit);
+	signal(SIGTERM, int_exit);
+	signal(SIGABRT, int_exit);
+    
 
-// int parseString(char* input, char*** argv) {
-//     char* token = strtok(input, " ");  // Tokenize the input string using spaces as delimiters
-//     int count = 0;
+    xdp_general_init(number_of_sockets, interface_name, threads);
 
-//     while (token != NULL) {
-//         (*argv)[count] = strdup(token);  // Copy the token into argv
-//         token = strtok(NULL, " ");  // Get the next token
-//         count++;
-//     }
+    int id[number_of_sockets];
+    for(int i=0; i<number_of_sockets; i++){
+        id[i] = i;
+        xdp_init_thread(number_of_sockets, interface_name, i);
+        pthread_create(&threads[i], NULL, (void*)work_tx, (void*)&id[i]);
+    }
+    sigset_t mask, old_mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigprocmask(SIG_BLOCK, &mask, &old_mask);
+    // Wait for the threads to finish
+    for(int i=0; i<number_of_sockets; i++){
+        pthread_join(threads[i], NULL);
+    }
 
-//     return count;
-// }
+    final_cleanup();
+    return 0;
+}
+
+
 
 
 

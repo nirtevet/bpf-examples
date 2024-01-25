@@ -5,7 +5,7 @@
 #include <getopt.h>
 #include <libgen.h>
 #include <linux/bpf.h>
-//#include <linux/err.h>
+#include <linux/err.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
 #include <linux/if_ether.h>
@@ -39,6 +39,7 @@
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <stdatomic.h>
 #include "xdpsock.h"
 
 #ifndef SOL_XDP
@@ -66,7 +67,7 @@
 #define MAX_PKT_SIZE 9728 /* Max frame size supported by many NICs */
 #define IS_EOP_DESC(options) (!((options) & XDP_PKT_CONTD))
 
-#define DEBUG_HEXDUMP 1
+#define DEBUG_HEXDUMP 0
 
 #define VLAN_PRIO_MASK		0xe000 /* Priority Code Point */
 #define VLAN_PRIO_SHIFT		13
@@ -79,6 +80,7 @@
 
 #define SCHED_PRI__DEFAULT	0
 #define STRERR_BUFSIZE          1024
+
 #define MASK_FOR_UMEM_ADDRESS 0x1FFFFF
 #define CONVERT_TO_RELATIVE_ADDRESS(addr) (addr & MASK_FOR_UMEM_ADDRESS)
 
@@ -93,81 +95,54 @@ static long tx_cycle_diff_max;
 static double tx_cycle_diff_ave;
 static long tx_cycle_cnt;
 
-enum benchmark_type {
-	BENCH_RXDROP = 0,
-	BENCH_TXONLY = 1,
-	BENCH_L2FWD = 2,
-};
-
-static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
-static u32 prog_id;
-
-static enum benchmark_type opt_bench = BENCH_RXDROP;
 static enum xdp_attach_mode opt_attach_mode = XDP_MODE_NATIVE;
 static const char *opt_if = "";
 static int opt_ifindex;
-static int opt_queue;
+
 static unsigned long opt_duration;
 static unsigned long start_time;
-static bool benchmark_done;
-static u32 opt_batch_size = 64;
-static int opt_pkt_count;
+bool benchmark_done = false;
+static u32 opt_batch_size = 1024;
+
 static u16 opt_pkt_size = MIN_PKT_SIZE;
-static u32 opt_pkt_fill_pattern = 0x12345678;
-static bool opt_vlan_tag;
-static u16 opt_pkt_vlan_id = VLAN_VID__DEFAULT;
-static u16 opt_pkt_vlan_pri = VLAN_PRI__DEFAULT;
-static struct ether_addr opt_txdmac = {{ 0x3c, 0xfd, 0xfe,
-					 0x9e, 0x7f, 0x71 }};
-static struct ether_addr opt_txsmac = {{ 0xec, 0xb1, 0xd7,
-					 0x98, 0x3a, 0xc0 }};
+
+
 static bool opt_extra_stats;
-static bool opt_quiet;
+static bool opt_quiet = false; //print stats to terminal
 static bool opt_app_stats;
-static const char *opt_irq_str = "";
+
 static u32 irq_no;
 static int irqs_at_init = -1;
-static u32 sequence;
+
 static int opt_poll;
 static int opt_interval = 1;
-static int opt_retries = 3;
+
 static u32 opt_xdp_bind_flags = XDP_USE_NEED_WAKEUP;
 static u32 opt_umem_flags;
-static int opt_unaligned_chunks;
+
 static int opt_mmap_flags;
 static int opt_xsk_frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE;
 static int frames_per_pkt;
-static int opt_timeout = 1000;
+
 static bool opt_need_wakeup = true;
 static u32 opt_num_xsks = 1;
-static bool opt_busy_poll;
-static bool opt_reduced_cap = false;
+
 static clockid_t opt_clock = CLOCK_MONOTONIC;
 static unsigned long opt_tx_cycle_ns;
 static int opt_schpolicy = SCHED_OTHER;
 static int opt_schprio = SCHED_PRI__DEFAULT;
-static bool opt_tstamp;
+
 static struct xdp_program *xdp_prog;
 static bool opt_frags;
-static bool load_xdp_prog=true;
-static pthread_t pt;
-static void *bufs;
-static struct xsk_umem_info *umem;
+static bool load_xdp_prog = true;
 
-struct packet_desc
- {
-	//char *packet  need to deside between char* pkt to addres, depend where we will do the IS_EOP()
-	u64 addr;
-	u32 len;
-	u32 option;
-};
+static bool finish_flag = false;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t* threads;
 
-void print_packet_desc(struct packet_desc desc){
-	printf("\naddr = %llx\n", desc.addr);
-	printf("\nlen = %d\n", desc.len);
-	printf("\noption = %d\n", desc.option);
-
-}
+static struct xsk_umem_info *umems[MAX_SOCKS];
+static void** bufs_array[MAX_SOCKS];
+static bool opt_vlan_tag;
 
 struct vlan_ethhdr {
 	unsigned char h_dest[6];
@@ -175,14 +150,6 @@ struct vlan_ethhdr {
 	__be16 h_vlan_proto;
 	__be16 h_vlan_TCI;
 	__be16 h_vlan_encapsulated_proto;
-};
-
-#define PKTGEN_MAGIC 0xbe9be955
-struct pktgen_hdr {
-	__be32 pgh_magic;
-	__be32 seq_num;
-	__be32 tv_sec;
-	__be32 tv_usec;
 };
 
 struct xsk_ring_stats {
@@ -242,13 +209,6 @@ struct xsk_socket_info {
 	struct xsk_app_stats app_stats;
 	struct xsk_driver_stats drv_stats;
 	u32 outstanding_tx;
-	u32 channel_id; /**< Channel ID of this xsk */
-	u32 xsk_index; /**< Index of this xsk within xsks */
-	struct xsk_ring_prod fq; /**< Dedicated fill queue */
-	struct xsk_ring_cons cq; /**< Dedicated comp queue */
-	u64 umem_offset; /**< Umem offset of descriptors for this XSK */
-	u32 key;
-	u32 fd;
 };
 
 static const struct clockid_map {
@@ -271,38 +231,18 @@ static const struct sched_map {
 	{ NULL }
 };
 
-static int num_socks = 0;
+struct packet_desc
+ {
+	u64 addr;
+	u32 len;
+	u32 option;
+};
+
+static int num_socks;
 struct xsk_socket_info *xsks[MAX_SOCKS];
 int sock;
-
-
-static int get_clockid(clockid_t *id, const char *name)
-{
-	const struct clockid_map *clk;
-
-	for (clk = clockids_map; clk->name; clk++) {
-		if (strcasecmp(clk->name, name) == 0) {
-			*id = clk->clockid;
-			return 0;
-		}
-	}
-
-	return -1;
-}
-
-static int get_schpolicy(int *policy, const char *name)
-{
-	const struct sched_map *sch;
-
-	for (sch = schmap; sch->name; sch++) {
-		if (strcasecmp(sch->name, name) == 0) {
-			*policy = sch->policy;
-			return 0;
-		}
-	}
-
-	return -1;
-}
+pthread_t pt;
+void *bufs;
 
 static unsigned long get_nsecs(void)
 {
@@ -312,19 +252,9 @@ static unsigned long get_nsecs(void)
 	return ts.tv_sec * 1000000000UL + ts.tv_nsec;
 }
 
-
 static void print_benchmark(bool running)
 {
-	const char *bench_str = "INVALID";
-
-	if (opt_bench == BENCH_RXDROP)
-		bench_str = "rxdrop";
-	else if (opt_bench == BENCH_TXONLY)
-		bench_str = "txonly";
-	else if (opt_bench == BENCH_L2FWD)
-		bench_str = "l2fwd";
-
-	printf("%s:%d %s ", opt_if, opt_queue, bench_str);
+	printf("%s:", opt_if);
 	if (opt_attach_mode == XDP_MODE_SKB)
 		printf("xdp-skb ");
 	else if (opt_attach_mode == XDP_MODE_NATIVE)
@@ -364,7 +294,6 @@ static int xsk_get_xdp_stats(int fd, struct xsk_socket_info *xsk)
 
 	return -EINVAL;
 }
-
 
 static void dump_app_stats(long dt)
 {
@@ -414,49 +343,6 @@ static void dump_app_stats(long dt)
 	}
 }
 
-static inline int get_batch_size(int pkt_cnt)
-{
-	if (!opt_pkt_count)
-		return opt_batch_size * frames_per_pkt;
-
-	if (pkt_cnt + opt_batch_size <= opt_pkt_count)
-		return opt_batch_size * frames_per_pkt;
-
-	return (opt_pkt_count - pkt_cnt) * frames_per_pkt;
-}
-
-static bool get_interrupt_number(void)
-{
-	FILE *f_int_proc;
-	char line[4096];
-	bool found = false;
-
-	f_int_proc = fopen("/proc/interrupts", "r");
-	if (f_int_proc == NULL) {
-		printf("Failed to open /proc/interrupts.\n");
-		return found;
-	}
-
-	while (!feof(f_int_proc) && !found) {
-		/* Make sure to read a full line at a time */
-		if (fgets(line, sizeof(line), f_int_proc) == NULL ||
-				line[strlen(line) - 1] != '\n') {
-			printf("Error reading from interrupts file\n");
-			break;
-		}
-
-		/* Extract interrupt number from line */
-		if (strstr(line, opt_irq_str) != NULL) {
-			irq_no = atoi(line);
-			found = true;
-			break;
-		}
-	}
-
-	fclose(f_int_proc);
-
-	return found;
-}
 
 static int get_irqs(void)
 {
@@ -656,14 +542,6 @@ static void remove_xdp_program(void)
 		fprintf(stderr, "Could not detach XDP program. Error: %s\n", strerror(-err));
 }
 
-static void int_exit(int sig)
-{
-	benchmark_done = true;
-	if (load_xdp_prog)
-		remove_xdp_program();
-	exit(EXIT_FAILURE);
-}
-
 static void __exit_with_error(int error, const char *file, const char *func,
 			      int line)
 {
@@ -677,26 +555,62 @@ static void __exit_with_error(int error, const char *file, const char *func,
 
 #define exit_with_error(error) __exit_with_error(error, __FILE__, __func__, __LINE__)
 
-static void xdpsock_cleanup(void)
-{
-	struct xsk_umem *umem = xsks[0]->umem->umem;
-	int i, cmd = CLOSE_CONN;
 
-	dump_stats();
-	for (i = 0; i < num_socks; i++)
-		xsk_socket__delete(xsks[i]->xsk);
-	(void)xsk_umem__delete(umem);
-
-	if (opt_reduced_cap) {
-		if (write(sock, &cmd, sizeof(int)) < 0)
-			exit_with_error(errno);
-	}
-
-	if (load_xdp_prog)
-		remove_xdp_program();
+void handle_signals() {
+    sigset_t mask, old_mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigprocmask(SIG_BLOCK, &mask, &old_mask);
 }
 
-static void hex_dump(void *pkt, size_t length, u64 addr)
+static void xdpsock_cleanup(int xsk_idx)
+{
+	dump_stats();
+	if(xsk_idx > -1){
+		xsk_socket__delete(xsks[xsk_idx]->xsk);
+	}
+}
+
+void notify_threads(pthread_t current_thread_id) {
+    pthread_mutex_lock(&mutex);
+    int socket_index = -1;
+    for (size_t i = 0; i < opt_num_xsks; i++) {
+        if (threads[i] == current_thread_id) {
+			socket_index = i;
+            continue; // Skip the current thread
+        }
+
+        if (!finish_flag) {
+            pthread_kill(threads[i], SIGINT);
+        }
+    }
+
+    if (!finish_flag) {
+        finish_flag = true;
+    }
+	if(current_thread_id != pt){
+		xdpsock_cleanup(socket_index);
+	}
+    pthread_mutex_unlock(&mutex);
+}
+
+
+
+void xdp_exit(void) {
+    handle_signals();
+    pthread_t thread_id = pthread_self();
+    notify_threads(thread_id);
+    pthread_exit(NULL);
+}
+
+
+static void int_exit(int sig)
+{
+	benchmark_done = true;
+	xdp_exit();
+}
+
+static inline void hex_dump(void *pkt, size_t length, u64 addr)
 {
 	const unsigned char *address = (unsigned char *)pkt;
 	const unsigned char *line = address;
@@ -708,9 +622,9 @@ static void hex_dump(void *pkt, size_t length, u64 addr)
 	if (!DEBUG_HEXDUMP)
 		return;
 
-	//sprintf(buf, "addr=%llu", addr);
+	sprintf(buf, "addr=%llu", addr);
 	printf("length = %zu\n", length);
-	//printf("%s | ", buf);
+	printf("%s | ", buf);
 	while (length-- > 0) {
 		printf("%02X ", *address++);
 		if (!(++i % line_size) || (length == 0 && i % line_size)) {
@@ -724,27 +638,11 @@ static void hex_dump(void *pkt, size_t length, u64 addr)
 				printf("%c", (c < 33 || c == 255) ? 0x2E : c);
 			}
 			printf("\n");
-			//if (length > 0)
-				//printf("%s | ", buf);
+			if (length > 0)
+				printf("%s | ", buf);
 		}
 	}
 	printf("\n");
-}
-
-static void *memset32_htonl(void *dest, u32 val, u32 size)
-{
-	u32 *ptr = (u32 *)dest;
-	int i;
-
-	val = htonl(val);
-
-	for (i = 0; i < (size & (~0x3)); i += 4)
-		ptr[i >> 2] = val;
-
-	for (; i < size; i++)
-		((char *)dest)[i] = ((char *)&val)[i & 3];
-
-	return dest;
 }
 
 /*
@@ -905,14 +803,38 @@ static inline u16 udp_csum(u32 saddr, u32 daddr, u32 len,
 	return csum_tcpudp_magic(saddr, daddr, len, proto, csum);
 }
 
+struct pktgen_hdr {
+	__be32 pgh_magic;
+	__be32 seq_num;
+	__be32 tv_sec;
+	__be32 tv_usec;
+};
+
+
+static void *memset32_htonl(void *dest, u32 val, u32 size)
+{
+	u32 *ptr = (u32 *)dest;
+	int i;
+
+	val = htonl(val);
+
+	for (i = 0; i < (size & (~0x3)); i += 4)
+		ptr[i >> 2] = val;
+
+	for (; i < size; i++)
+		((char *)dest)[i] = ((char *)&val)[i & 3];
+
+	return dest;
+}
+
 #define ETH_FCS_SIZE 4
 
 #define ETH_HDR_SIZE (opt_vlan_tag ? sizeof(struct vlan_ethhdr) : \
 		      sizeof(struct ethhdr))
-#define PKTGEN_HDR_SIZE (opt_tstamp ? sizeof(struct pktgen_hdr) : 0)
+#define PKTGEN_HDR_SIZE (sizeof(struct pktgen_hdr))
 #define PKT_HDR_SIZE (ETH_HDR_SIZE + sizeof(struct iphdr) + \
 		      sizeof(struct udphdr) + PKTGEN_HDR_SIZE)
-#define PKTGEN_HDR_OFFSET (ETH_HDR_SIZE + sizeof(struct iphdr) + \
+// #define PKTGEN_HDR_OFFSET (ETH_HDR_SIZE + sizeof(struct iphdr) + \
 			   sizeof(struct udphdr))
 #define PKTGEN_SIZE_MIN (PKTGEN_HDR_OFFSET + sizeof(struct pktgen_hdr) + \
 			 ETH_FCS_SIZE)
@@ -922,103 +844,6 @@ static inline u16 udp_csum(u32 saddr, u32 daddr, u32 len,
 #define UDP_PKT_SIZE		(IP_PKT_SIZE - sizeof(struct iphdr))
 #define UDP_PKT_DATA_SIZE	(UDP_PKT_SIZE - \
 				 (sizeof(struct udphdr) + PKTGEN_HDR_SIZE))
-
-static u8 pkt_data[MAX_PKT_SIZE];
-
-static void gen_eth_hdr_data(void)
-{
-	struct pktgen_hdr *pktgen_hdr;
-	struct udphdr *udp_hdr;
-	struct iphdr *ip_hdr;
-
-	if (opt_vlan_tag) {
-		struct vlan_ethhdr *veth_hdr = (struct vlan_ethhdr *)pkt_data;
-		u16 vlan_tci = 0;
-
-		udp_hdr = (struct udphdr *)(pkt_data +
-					    sizeof(struct vlan_ethhdr) +
-					    sizeof(struct iphdr));
-		ip_hdr = (struct iphdr *)(pkt_data +
-					  sizeof(struct vlan_ethhdr));
-		pktgen_hdr = (struct pktgen_hdr *)(pkt_data +
-						   sizeof(struct vlan_ethhdr) +
-						   sizeof(struct iphdr) +
-						   sizeof(struct udphdr));
-		/* ethernet & VLAN header */
-		memcpy(veth_hdr->h_dest, &opt_txdmac, ETH_ALEN);
-		memcpy(veth_hdr->h_source, &opt_txsmac, ETH_ALEN);
-		veth_hdr->h_vlan_proto = htons(ETH_P_8021Q);
-		vlan_tci = opt_pkt_vlan_id & VLAN_VID_MASK;
-		vlan_tci |= (opt_pkt_vlan_pri << VLAN_PRIO_SHIFT) & VLAN_PRIO_MASK;
-		veth_hdr->h_vlan_TCI = htons(vlan_tci);
-		veth_hdr->h_vlan_encapsulated_proto = htons(ETH_P_IP);
-	} else {
-		struct ethhdr *eth_hdr = (struct ethhdr *)pkt_data;
-
-		udp_hdr = (struct udphdr *)(pkt_data +
-					    sizeof(struct ethhdr) +
-					    sizeof(struct iphdr));
-		ip_hdr = (struct iphdr *)(pkt_data +
-					  sizeof(struct ethhdr));
-		pktgen_hdr = (struct pktgen_hdr *)(pkt_data +
-						   sizeof(struct ethhdr) +
-						   sizeof(struct iphdr) +
-						   sizeof(struct udphdr));
-		/* ethernet header */
-		memcpy(eth_hdr->h_dest, &opt_txdmac, ETH_ALEN);
-		memcpy(eth_hdr->h_source, &opt_txsmac, ETH_ALEN);
-		eth_hdr->h_proto = htons(ETH_P_IP);
-	}
-
-
-	/* IP header */
-	ip_hdr->version = IPVERSION;
-	ip_hdr->ihl = 0x5; /* 20 byte header */
-	ip_hdr->tos = 0x0;
-	ip_hdr->tot_len = htons(IP_PKT_SIZE);
-	ip_hdr->id = 0;
-	ip_hdr->frag_off = 0;
-	ip_hdr->ttl = IPDEFTTL;
-	ip_hdr->protocol = IPPROTO_UDP;
-	ip_hdr->saddr = htonl(0x0a0a0a10);
-	ip_hdr->daddr = htonl(0x0a0a0a20);
-
-	/* IP header checksum */
-	ip_hdr->check = 0;
-	ip_hdr->check = ip_fast_csum((const void *)ip_hdr, ip_hdr->ihl);
-
-	/* UDP header */
-	udp_hdr->source = htons(0x1000);
-	udp_hdr->dest = htons(0x1000);
-	udp_hdr->len = htons(UDP_PKT_SIZE);
-
-	if (opt_tstamp)
-		pktgen_hdr->pgh_magic = htonl(PKTGEN_MAGIC);
-
-	/* UDP data */
-	memset32_htonl(pkt_data + PKT_HDR_SIZE, opt_pkt_fill_pattern,
-		       UDP_PKT_DATA_SIZE);
-
-	/* UDP header checksum */
-	udp_hdr->check = 0;
-	udp_hdr->check = udp_csum(ip_hdr->saddr, ip_hdr->daddr, UDP_PKT_SIZE,
-				  IPPROTO_UDP, (u16 *)udp_hdr);
-}
-
-static void gen_eth_frame(struct xsk_umem_info *umem, u64 addr)
-{
-	static u32 len;
-	u32 copy_len = opt_xsk_frame_size;
-
-	if (!len)
-		len = PKT_SIZE;
-
-	if (len < opt_xsk_frame_size)
-		copy_len = len;
-	memcpy(xsk_umem__get_data(umem->buffer, addr),
-			pkt_data + PKT_SIZE - len, copy_len);
-	len -= copy_len;
-}
 
 static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 {
@@ -1037,7 +862,7 @@ static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 		.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
 		.frame_size = opt_xsk_frame_size,
 		.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
-		.flags = opt_umem_flags | XDP_SHARED_UMEM 
+		.flags = opt_umem_flags
 	};
 	int ret;
 
@@ -1069,37 +894,8 @@ static void xsk_populate_fill_ring(struct xsk_umem_info *umem)
 	xsk_ring_prod__submit(&umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS * 2);
 }
 
-static void xsk_populate_fill_ring_multicore(struct xsk_umem_info *umem, struct xsk_socket_info *xsk)
-{
-	int ret, i;
-	u32 idx;
-
-	if (umem == NULL || xsk == NULL)
-		exit_with_error(-EINVAL);
-
-	fprintf(stdout, "Filling multi-FCQ XSK[%u] from umem_offset:%llu\n",
-		xsk->xsk_index, xsk->umem_offset);
-
-	/* Multi FCQ mode, we fill the xsk->fq. */
-	struct xsk_ring_prod *fq_ptr = &xsk->fq;
-
-	/* In a multi-FCQ setup, umem size is multiplied by the number of XSK sockets we have. That
-	 * means our umem offset for each descriptor is not uniform - and is different on a per-FQ/CQ
-	 * basis. */
-	int offset = xsk->umem_offset;
-
-	ret = xsk_ring_prod__reserve(fq_ptr,
-				     XSK_RING_PROD__DEFAULT_NUM_DESCS * 2, &idx);
-	if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS * 2)
-		exit_with_error(-ret);
-	for (i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS * 2; i++)
-		*xsk_ring_prod__fill_addr(fq_ptr, idx++) =
-			offset + (i * opt_xsk_frame_size);
-	xsk_ring_prod__submit(fq_ptr, XSK_RING_PROD__DEFAULT_NUM_DESCS * 2);
-}
-
 static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
-						    bool rx, bool tx)
+						    bool rx, bool tx, int queue_id)
 {
 	struct xsk_socket_config cfg;
 	struct xsk_socket_info *xsk;
@@ -1114,8 +910,9 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	xsk->umem = umem;
 	cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
-	if (load_xdp_prog || opt_reduced_cap)
-		cfg.libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
+	if (load_xdp_prog){
+		cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+	}
 	else
 		cfg.libxdp_flags = 0;
 	if (opt_attach_mode == XDP_MODE_SKB)
@@ -1126,8 +923,9 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 
 	rxr = rx ? &xsk->rx : NULL;
 	txr = tx ? &xsk->tx : NULL;
-	ret = xsk_socket__create(&xsk->xsk, opt_if, opt_queue, umem->umem,
-				 rxr, txr, &cfg);
+
+	ret = xsk_socket__create(&xsk->xsk, opt_if, queue_id, umem->umem,rxr, txr, &cfg);
+	
 	if (ret)
 		exit_with_error(-ret);
 
@@ -1145,27 +943,64 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	return xsk;
 }
 
-static void kick_tx(struct xsk_socket_info *xsk) {
-    int ret;
+inline static void kick_tx(struct xsk_socket_info *xsk)
+{
+	int ret;
+	ret = sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 
-    // Perform a non-blocking sendto to wake up the transmission queue
-    ret = sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	if (ret >= 0 || errno == ENOBUFS || errno == EAGAIN ||
+	    errno == EBUSY || errno == ENETDOWN)
+		return;
+	exit_with_error(errno);
+}
 
-    // Check for successful transmission or expected non-blocking errors
-    if (ret >= 0 || errno == ENOBUFS || errno == EAGAIN ||
-        errno == EBUSY || errno == ENETDOWN)
-        return;
+static inline void complete_tx_release_rx(struct xsk_socket_info *xsk)
+{
+	struct xsk_umem_info *umem = xsk->umem;
+	u32 idx_cq = 0, idx_fq = 0;
+	unsigned int rcvd;
+	size_t ndescs;
 
-    // If an unexpected error occurs, exit the program with an error message
-    exit_with_error(errno);
+	if (!xsk->outstanding_tx)
+		return;
+
+	ndescs = (xsk->outstanding_tx > opt_batch_size) ? opt_batch_size :
+		xsk->outstanding_tx;
+
+	/* re-add completed Tx buffers */
+	rcvd = xsk_ring_cons__peek(&umem->cq, ndescs, &idx_cq);
+	if (rcvd > 0) {
+		unsigned int i;
+		int ret;
+
+		ret = xsk_ring_prod__reserve(&umem->fq, rcvd, &idx_fq);
+		while (ret != rcvd) {
+			if (ret < 0)
+				exit_with_error(-ret);
+			if (xsk_ring_prod__needs_wakeup(&umem->fq)) {
+				xsk->app_stats.fill_fail_polls++;
+				recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL,
+					 NULL);
+			}
+			ret = xsk_ring_prod__reserve(&umem->fq, rcvd, &idx_fq);
+		}
+
+		for (i = 0; i < rcvd; i++)
+			*xsk_ring_prod__fill_addr(&umem->fq, idx_fq++) =
+				*xsk_ring_cons__comp_addr(&umem->cq, idx_cq++);
+
+		xsk_ring_prod__submit(&xsk->umem->fq, rcvd);
+		xsk_ring_cons__release(&xsk->umem->cq, rcvd);
+		xsk_ring_cons__release(&xsk->rx, rcvd);
+		xsk->outstanding_tx -= rcvd;
+	}
 }
 
 static inline void complete_tx_only(struct xsk_socket_info *xsk,
 				    int batch_size)
 {
 	unsigned int rcvd;
-	u32 idx_fq = 0;
-	u32 idx_cq = 0;
+	u32 idx;
 
 	if (!xsk->outstanding_tx)
 		return;
@@ -1175,331 +1010,11 @@ static inline void complete_tx_only(struct xsk_socket_info *xsk,
 		kick_tx(xsk);
 	}
 
-	rcvd = xsk_ring_cons__peek(&xsk->cq, batch_size, &idx_cq);
-
+	rcvd = xsk_ring_cons__peek(&xsk->umem->cq, batch_size, &idx);
 	if (rcvd > 0) {
-		unsigned int i;
-		int ret;
-
-		ret = xsk_ring_prod__reserve(&xsk->fq, rcvd, &idx_fq);
-		while (ret != rcvd) {
-			if (ret < 0)
-				exit_with_error(-ret);
-			if (opt_busy_poll || xsk_ring_prod__needs_wakeup(&xsk->fq)) {
-				xsk->app_stats.fill_fail_polls++;
-				recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL,
-					 NULL);
-			}
-			ret = xsk_ring_prod__reserve(&xsk->fq, rcvd, &idx_fq);
-		}
-
-		for (i = 0; i < rcvd; i++)
-			*xsk_ring_prod__fill_addr(&xsk->fq, idx_fq++) =
-				*xsk_ring_cons__comp_addr(&xsk->cq, idx_cq++);
-
-		xsk_ring_prod__submit(&xsk->fq, rcvd);
-		xsk_ring_cons__release(&xsk->cq, rcvd);
-		xsk_ring_cons__release(&xsk->rx, rcvd);
+		xsk_ring_cons__release(&xsk->umem->cq, rcvd);
 		xsk->outstanding_tx -= rcvd;
 	}
-}
-
-static u16 ophir_rx_only(u16 xsk_id, 
-						 struct packet_desc *rx_array,
-						 u16 array_size) {
-
-    unsigned int rcvd, i, eop_cnt = 0;
-    u32 idx_rx = 0, idx_fq = 0, wanted_num_of_packets = 0;
-    int ret;
-	struct xsk_socket_info *xsk = xsks[xsk_id];
-	// printf("rx: socket_id = %d\n", xsk_id);
-    // Peek into the receive ring buffer to check the number of received packets
-    rcvd = xsk_ring_cons__peek(&xsk->rx, opt_batch_size, &idx_rx);
-	
-    // If no packets are received, perform optional polling or wait for a wakeup signal
-    if (!rcvd) {
-		//print("111\n");
-        if (opt_busy_poll || xsk_ring_prod__needs_wakeup(&xsk->fq)) {
-            xsk->app_stats.rx_empty_polls++;
-            recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL); // Read 0 bits from fd to null
-        }
-        return 0;
-    }
-	//printf("222\n");
-    // Determine the number of packets to process, capped by the array size or the received count
-    wanted_num_of_packets = array_size < rcvd ? array_size : rcvd;
-
-    // Process each packet and populate the provided array
-    for (i = 0; i < wanted_num_of_packets; i++) {
-        const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++);
-        u64 addr = desc->addr;
-		// printf("\naddr = 0x%llx", addr);
-        u32 len = desc->len;
-		// printf("\nlen = 0x%llx", len);
-        u64 orig = xsk_umem__extract_addr(addr);
-		// printf("\naddr = 0x%llx", orig);
-        eop_cnt += IS_EOP_DESC(desc->options);
-
-        addr = xsk_umem__add_offset_to_addr(addr);
-		// printf("\naddr after add offset= 0x%llx", addr);
-        char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-		// printf("\naddr after get data= 0x%llx", pkt);
-        rx_array[i].addr = pkt;
-        rx_array[i].len = len;
-        rx_array[i].option = desc->options;
-	}
-
-    ///printf("333\n");
-    // Update statistics
-    xsk->ring_stats.rx_npkts += eop_cnt;
-    xsk->ring_stats.rx_frags += rcvd;
-	return wanted_num_of_packets;
-}
-
-
-static void ophir_rx_release(u16 xsk_id, u32 done_packets,
-							 struct packet_desc* pkt_array) 
-    // we need to Check if the number of done_packets is less than rx_size and pkt_array_id is within bounds
-    // Also, ensure that xsks[pkt_array_id] is not NULL
-    // If any of these conditions are not met, exit with an error code
-{
-	unsigned int rcvd, i, eop_cnt = 0;
-	u32 idx_rx = 0, idx_fq = 0;
-	int ret;
-	struct xsk_socket_info *xsk = xsks[xsk_id];
-
-	ret = xsk_ring_prod__reserve(&xsk->fq, rcvd, &idx_fq);
-	while (ret != rcvd) {
-		if (ret < 0)
-			exit_with_error(-ret);
-		if (opt_busy_poll || xsk_ring_prod__needs_wakeup(&xsk->fq)) {
-			xsk->app_stats.fill_fail_polls++;
-			recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
-		}
-		ret = xsk_ring_prod__reserve(&xsk->fq, rcvd, &idx_fq);
-	}
-
-	for (i = 0; i < rcvd; i++) {
-		u64 addr = CONVERT_TO_RELATIVE_ADDRESS(pkt_array[i].addr);
-		*xsk_ring_prod__fill_addr(&xsk->fq, idx_fq++) = addr;
-	}
-
-	xsk_ring_prod__submit(&xsk->fq, rcvd);
-	xsk_ring_cons__release(&xsk->rx, rcvd);
-}
-
-static inline void ophir_tx_release_complete_tx_only(struct xsk_socket_info *xsk,
-													 int nb_frames) {
-    unsigned int rcvd;
-    u32 idx;
-//need to understand where to call it, maybe from our ophir_tx_only
-    // If there are no outstanding transmissions, nothing to complete
-	printf("111 \n");
-    if (!xsk->outstanding_tx)
-        return;
-	printf("222 \n");
-    // If wakeup is needed or explicitly requested, perform wakeup and update statistics
-    if (!opt_need_wakeup || xsk_ring_prod__needs_wakeup(&xsk->tx)) {
-        xsk->app_stats.tx_wakeup_sendtos++;
-        kick_tx(xsk);
-    }
-	printf("333 \n");
-    // Peek into the completion ring buffer to check the number of completed transmissions
-    rcvd = xsk_ring_cons__peek(&xsk->cq, nb_frames, &idx);
-
-    // If there are completed transmissions, release them and update outstanding_tx count
-    if (rcvd > 0) {
-        xsk_ring_cons__release(&xsk->cq, rcvd);
-        xsk->outstanding_tx -= rcvd;
-    }
-}
-
-
-static int ophir_tx_only(u32 xsk_idx, struct packet_desc* tx_array, int batch_size, u32 pkt_cnt)
-{
-	
-	u32 idx;
-	u32 frame_nb = 0;
-	unsigned int i;
-	u32 packets_done = 0;
-	struct xsk_socket_info *xsk = xsks[xsk_idx];
-	if(!pkt_cnt){
-		return 0;
-	}
-
-	while(packets_done < pkt_cnt){
-
-		if(pkt_cnt - packets_done < batch_size){
-			batch_size = pkt_cnt - packets_done;
-		}
-
-		while (xsk_ring_prod__reserve(&xsk->tx, batch_size, &idx) < batch_size) {
-			complete_tx_only(xsk, batch_size);
-		}
-
-		for (i = 0; i < batch_size; ) {
-			u32 len = tx_array[i].len;
-
-			do {
-				struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, idx + i);
-				tx_desc->addr = CONVERT_TO_RELATIVE_ADDRESS(tx_array[packets_done].addr);
-				if (len > opt_xsk_frame_size) {
-					tx_desc->len = opt_xsk_frame_size;
-					tx_desc->options = XDP_PKT_CONTD;
-				} else {
-					tx_desc->len = len;
-					tx_desc->options = 0;
-					xsk->ring_stats.tx_npkts++;
-					packets_done++;
-				}
-				len -= tx_desc->len;
-				frame_nb = (frame_nb + 1) % NUM_FRAMES;
-				i++;
-			} while (len);
-		}
-		xsk_ring_prod__submit(&xsk->tx, batch_size);
-		xsk->outstanding_tx += batch_size;
-		xsk->ring_stats.tx_frags += batch_size;
-		complete_tx_only(xsk, batch_size);
-	}
-	return batch_size / frames_per_pkt;
-}
-
-static int tx_only(struct xsk_socket_info *xsk,
-				   u32 *frame_nb,
-				   int batch_size,
-				   unsigned long tx_ns) {
-    u32 idx, tv_sec, tv_usec;
-    unsigned int i;
-
-    // Reserve space in the transmit ring buffer for the specified batch size
-    while (xsk_ring_prod__reserve(&xsk->tx, batch_size, &idx) < batch_size) {
-        // If unable to reserve enough space, complete any outstanding transmissions
-        complete_tx_only(xsk, batch_size);
-
-        // Check if the benchmark is done, and if so, return
-        if (benchmark_done)
-            return 0;
-    }
-
-    // If timestamping is enabled, calculate seconds and microseconds
-    if (opt_tstamp) {
-        tv_sec = (u32)(tx_ns / NSEC_PER_SEC);
-        tv_usec = (u32)((tx_ns % NSEC_PER_SEC) / 1000);
-    }
-
-    // Loop through each packet in the batch
-    for (i = 0; i < batch_size; ) {
-        u32 len = PKT_SIZE;
-
-        // Loop to create a multi-frame packet if necessary
-        do {
-            struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, idx + i);
-
-            // Set the address for the current frame
-            tx_desc->addr = *frame_nb * opt_xsk_frame_size;
-
-            // Determine length and options for the current frame
-            if (len > opt_xsk_frame_size) {
-                tx_desc->len = opt_xsk_frame_size;
-                tx_desc->options = XDP_PKT_CONTD;
-            } else {
-                tx_desc->len = len;
-                tx_desc->options = 0;
-                xsk->ring_stats.tx_npkts++;
-            }
-
-            // Update variables for the next iteration
-            len -= tx_desc->len;
-            *frame_nb = (*frame_nb + 1) % NUM_FRAMES;
-            i++;
-
-            // If timestamping is enabled, set timestamp information in the packet header
-            if (opt_tstamp) {
-                struct pktgen_hdr *pktgen_hdr;
-                u64 addr = tx_desc->addr;
-                char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-                pktgen_hdr = (struct pktgen_hdr *)(pkt + PKTGEN_HDR_OFFSET);
-
-                pktgen_hdr->seq_num = htonl(sequence++);
-                pktgen_hdr->tv_sec = htonl(tv_sec);
-                pktgen_hdr->tv_usec = htonl(tv_usec);
-
-
-            }
-        } while (len);
-    }
-
-    // The function does not submit the packets or update statistics here.
-    // This part of the functionality is expected to be handled elsewhere in your code.
-
-	xsk_ring_prod__submit(&xsk->tx, batch_size);
-	xsk->outstanding_tx += batch_size;
-	xsk->ring_stats.tx_frags += batch_size;
-	complete_tx_only(xsk, batch_size);
-
-	return batch_size / frames_per_pkt;
-}
-
-
-
-static int ophir_complete_tx_only_all(void) {
-    bool pending;
-    int i;
-	u32 num_of_realsed_desc = 0;
-
-	// we need to decide if that matter to us from which xsk we will realse.
-	//	if we will distribute the tx pakcet equal (replase the for to an hash)
-	// should not cause an issue. 
-
-    // Continue processing until all outstanding transmissions are completed or retries are exhausted
-    do {
-        pending = false;
-
-        // Iterate through each socket and complete outstanding transmissions
-        for (i = 0; i < num_socks; i++) {
-            // Check if the socket has outstanding transmissions
-            if (xsks[i]->outstanding_tx) {
-                // Complete outstanding transmissions for the current socket
-                num_of_realsed_desc += ophir_complete_tx_only(xsks[i], opt_batch_size);
-                // Check if there are still outstanding transmissions after completion
-                pending = !!xsks[i]->outstanding_tx;
-            }
-        }
-
-        // If there are still pending transmissions, sleep for 1 second and decrement retries
-        if (pending && opt_retries-- > 0) {
-            sleep(1);
-        }
-    } while (pending && opt_retries > 0);
-	return num_of_realsed_desc;
-}
-
-static void complete_tx_only_all(void) {
-    bool pending;
-    int i;
-
-    // Continue processing until all outstanding transmissions are completed or retries are exhausted
-    do {
-        pending = false;
-
-        // Iterate through each socket and complete outstanding transmissions
-        for (i = 0; i < num_socks; i++) {
-            // Check if the socket has outstanding transmissions
-            if (xsks[i]->outstanding_tx) {
-                // Complete outstanding transmissions for the current socket
-                complete_tx_only(xsks[i], opt_batch_size);
-                
-                // Check if there are still outstanding transmissions after completion
-                pending = !!xsks[i]->outstanding_tx;
-            }
-        }
-
-        // If there are still pending transmissions, sleep for 1 second and decrement retries
-        if (pending && opt_retries-- > 0) {
-            sleep(1);
-        }
-    } while (pending && opt_retries > 0);
 }
 
 static void load_xdp_program(void)
@@ -1583,115 +1098,37 @@ static int lookup_bpf_map(int prog_fd)
 	return xsks_map_fd;
 }
 
-
-
-// static void enter_xsks_into_map(void)
-// {
-// 	struct bpf_map *map;
-// 	int i, xsks_map;
-
-// 	map = bpf_object__find_map_by_name(xdp_program__bpf_obj(xdp_prog), "xsks_map");
-// 	xsks_map = bpf_map__fd(map);
-// 	if (xsks_map < 0) {
-// 		fprintf(stderr, "ERROR: no xsks map found: %s\n",
-// 			strerror(xsks_map));
-// 			exit(EXIT_FAILURE);
-// 	}
-
-// 	for (i = 0; i < num_socks; i++) {
-
-// 		if (i != xsks[i]->xsk_index)
-// 		{
-// 			fprintf(stderr, "ERROR: xsk with invalid xsk_index at index (xsk_index:%u, i:%d)\n",
-// 				xsks[i]->xsk_index, i);
-// 			exit(EXIT_FAILURE);
-// 		}
-
-// 		int fd = xsk_socket__fd(xsks[i]->xsk);
-// 		int key, ret;
-// 		/* In a multi-FCQ setup, we need to insert with key=channel */
-// 		key = xsks[i]->channel_id;
-// 		printf("chanel_id = %d\n", xsks[i]->channel_id);
-// 		ret = bpf_map_update_elem(xsks_map, &key, &fd, 0);
-// 		if (ret) {
-// 			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
-// 			exit(EXIT_FAILURE);
-// 		}
-
-// 		fprintf(stdout, "Inserted XSK[%u] fd:%d into xsks_map[key=%u]\n", xsks[i]->xsk_index, fd, key);
-// 	}
-// }
-
-int find_map_fd(struct bpf_object *bpf_obj, const char *mapname)
+static void enter_xsks_into_map_by_index(int xsk_index)
 {
-	struct bpf_map *map;
-	int map_fd = -1;
-
-	/* Lesson#3: bpf_object to bpf_map */
-	map = bpf_object__find_map_by_name(bpf_obj, mapname);
-        if (!map) {
-		fprintf(stderr, "ERR: cannot find map by name: %s\n", mapname);
-		goto out;
+	struct bpf_map *data_map;
+	int i, xsks_map;
+	data_map = bpf_object__find_map_by_name(xdp_program__bpf_obj(xdp_prog), ".bss");
+	if (!data_map || !bpf_map__is_internal(data_map)) {
+		fprintf(stderr, "ERROR: bss map found!\n");
+		exit(EXIT_FAILURE);
 	}
 
-	map_fd = bpf_map__fd(map);
- out:
-	return map_fd;
-}
-
-static void enter_xsks_into_map(void)
-{
-	//struct bpf_map *data_map;
-	int i, xsks_map;
-	int key = 0;
-
-	//data_map = bpf_object__find_map_by_name(xdp_program__bpf_obj(xdp_prog), ".bss");
-
-	xsks_map = find_map_fd(xdp_program__bpf_obj(xdp_prog), "xsks_map");
-	printf("xsks_map = %d\n", xsks_map);
-	// if (!data_map || !bpf_map__is_internal(data_map)) {
-	// 	fprintf(stderr, "ERROR: bss map found!\n");
-	// 	exit(EXIT_FAILURE);
-	// }
-	// if (bpf_map_update_elem(bpf_map__fd(data_map), &key, &num_socks, BPF_ANY)) {
-	// 	fprintf(stderr, "ERROR: bpf_map_update_elem num_socks %d!\n", num_socks);
-	// 	exit(EXIT_FAILURE);
-	// }
-	//xsks_map = lookup_bpf_map(xdp_program__fd(xdp_prog));
-	// printf("xsks_map = %p\n", xsks_map);
+	xsks_map = lookup_bpf_map(xdp_program__fd(xdp_prog));
 	if (xsks_map < 0) {
 		fprintf(stderr, "ERROR: no xsks map found: %s\n",
 			strerror(xsks_map));
 			exit(EXIT_FAILURE);
 	}
 
-	for (i = 0; i < num_socks; i++) {
-		xsks[i]->fd = xsk_socket__fd(xsks[i]->xsk);
-		printf("fd = %d\n", xsks[i]->fd);
-		int ret;
 
-		//key = xsks[i]->channel_id;
-		xsks[i]->key = 5;
-		printf("key: %llx\n", &key);
-		printf("channel id: %d\n", xsks[i]->channel_id);
-
-		ret = bpf_map_update_elem(xsks_map, &xsks[i]->key, &xsks[i]->fd, 0);
-
-		//printf("*x: %d\n", *x);
-		if (ret) {
-			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
-			exit(EXIT_FAILURE);
-		}
+	int fd = xsk_socket__fd(xsks[xsk_index]->xsk);
+	int ret;
+	int key = xsk_index;
+	ret = bpf_map_update_elem(xsks_map, &key, &fd, 0);
+	if (ret) {
+		fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
+		exit(EXIT_FAILURE);
 	}
 }
-
 
 static void apply_setsockopt(struct xsk_socket_info *xsk)
 {
 	int sock_opt;
-
-	if (!opt_busy_poll)
-		return;
 
 	sock_opt = 1;
 	if (setsockopt(xsk_socket__fd(xsk->xsk), SOL_SOCKET, SO_PREFER_BUSY_POLL,
@@ -1709,249 +1146,253 @@ static void apply_setsockopt(struct xsk_socket_info *xsk)
 		exit_with_error(errno);
 }
 
-static int recv_xsks_map_fd_from_ctrl_node(int sock, int *_fd)
-{
-	char cms[CMSG_SPACE(sizeof(int))];
-	struct cmsghdr *cmsg;
-	struct msghdr msg;
-	struct iovec iov;
-	int value;
-	int len;
 
-	iov.iov_base = &value;
-	iov.iov_len = sizeof(int);
+inline static u16 fill_rx_array(u16 xsk_id, 
+						 struct packet_desc *rx_array,
+						 u16 array_size) {
 
-	msg.msg_name = 0;
-	msg.msg_namelen = 0;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_flags = 0;
-	msg.msg_control = (caddr_t)cms;
-	msg.msg_controllen = sizeof(cms);
+    unsigned int rcvd, i, eop_cnt = 0;
+    u32 idx_rx = 0, wanted_num_of_packets = 0;
+	struct xsk_socket_info *xsk = xsks[xsk_id];
 
-	len = recvmsg(sock, &msg, 0);
+    // Peek into the receive ring buffer to check the number of received packets
+    rcvd = xsk_ring_cons__peek(&xsk->rx, opt_batch_size, &idx_rx);
+	
+    // If no packets are received, perform optional polling or wait for a wakeup signal
+    if (!rcvd) {
+        if (xsk_ring_prod__needs_wakeup(&xsk->umem->fq)) {
+            xsk->app_stats.rx_empty_polls++;
+            recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL); // Read 0 bits from fd to null
+        }
+        return 0;
+    }
+    // Determine the number of packets to process, capped by the array size or the received count
+    wanted_num_of_packets = array_size < rcvd ? array_size : rcvd;
 
-	if (len < 0) {
-		fprintf(stderr, "Recvmsg failed length incorrect.\n");
-		return -EINVAL;
+    // Process each packet and populate the provided array
+    for (i = 0; i < wanted_num_of_packets; i++) {
+        const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++);
+        u64 addr = desc->addr;
+        u32 len = desc->len;
+        eop_cnt += IS_EOP_DESC(desc->options);
+
+        addr = xsk_umem__add_offset_to_addr(addr);
+        char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+        rx_array[i].addr = (u64)pkt;
+        rx_array[i].len = len;
+        rx_array[i].option = desc->options;
 	}
 
-	if (len == 0) {
-		fprintf(stderr, "Recvmsg failed no data\n");
-		return -EINVAL;
-	}
-
-	cmsg = CMSG_FIRSTHDR(&msg);
-	*_fd = *(int *)CMSG_DATA(cmsg);
-
-	return 0;
+    // Update statistics
+    xsk->ring_stats.rx_npkts += eop_cnt;
+    xsk->ring_stats.rx_frags += rcvd;
+	return wanted_num_of_packets;
 }
 
-static int recv_xsks_map_fd(int *xsks_map_fd)
+
+inline static void release_rx(u16 xsk_id, u32 done_packets,
+							 struct packet_desc* pkt_array) 
+    // we need to Check if the number of done_packets is less than rx_size and pkt_array_id is within bounds
+    // Also, ensure that xsks[pkt_array_id] is not NULL
+    // If any of these conditions are not met, exit with an error code
 {
-	struct sockaddr_un server;
-	int err;
-
-	sock = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (sock < 0) {
-		fprintf(stderr, "Error opening socket stream: %s", strerror(errno));
-		return errno;
-	}
-
-	server.sun_family = AF_UNIX;
-	strcpy(server.sun_path, SOCKET_NAME);
-
-	if (connect(sock, (struct sockaddr *)&server, sizeof(struct sockaddr_un)) < 0) {
-		close(sock);
-		fprintf(stderr, "Error connecting stream socket: %s", strerror(errno));
-		return errno;
-	}
-
-	err = recv_xsks_map_fd_from_ctrl_node(sock, xsks_map_fd);
-	if (err) {
-		fprintf(stderr, "Error %d receiving fd\n", err);
-		return err;
-	}
-	return 0;
-}
-
-static struct xsk_socket_info *xsk_configure_socket_multicore(struct xsk_umem_info *umem,
-						    bool rx, bool tx, int xsk_index)
-{
-	struct xsk_socket_config cfg;
-	struct xsk_socket_info *xsk;
-	struct xsk_ring_cons *rxr;
-	struct xsk_ring_prod *txr;
+	unsigned int rcvd, i;
+	u32 idx_fq = 0;
 	int ret;
+	struct xsk_socket_info *xsk = xsks[xsk_id];
+	rcvd = done_packets < XSK_RING_CONS__DEFAULT_NUM_DESCS ? done_packets : XSK_RING_CONS__DEFAULT_NUM_DESCS;
+	ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
+	while (ret != rcvd) {
+		if (ret < 0)
+			exit_with_error(-ret);
+		if (xsk_ring_prod__needs_wakeup(&xsk->umem->fq)) {
+			xsk->app_stats.fill_fail_polls++;
+			recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
+		}
+		ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
+	}
 
-	xsk = calloc(1, sizeof(*xsk));
-	if (!xsk)
-		exit_with_error(errno);
+	for (i = 0; i < rcvd; i++) {
+		u64 addr = CONVERT_TO_RELATIVE_ADDRESS(pkt_array[i].addr);
+		*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) = addr;
+	}
 
-	xsk->umem = umem;
-	cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
-	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+	xsk_ring_prod__submit(&xsk->umem->fq, rcvd);
+	xsk_ring_cons__release(&xsk->rx, rcvd);
+}
+#define PKTGEN_HDR_OFFSET (ETH_HDR_SIZE + sizeof(struct iphdr) + \
+			   sizeof(struct udphdr))
+#define PKTGEN_SIZE_MIN (PKTGEN_HDR_OFFSET + sizeof(struct pktgen_hdr) + \
+			 ETH_FCS_SIZE)
+static u32 sequence;
+u32 frame_nb[MAX_SOCKS] = {0};
+static int tx_only(int xsk_id, int batch_size, unsigned long tx_ns)
+{
+	u32 idx, tv_sec, tv_usec;
+	unsigned int i;
 
+	while (xsk_ring_prod__reserve(&xsks[xsk_id]->tx, batch_size, &idx) <
+				      batch_size) {
+		complete_tx_only(xsks[xsk_id], batch_size);
+		if (benchmark_done)
+			return 0;
+	}
 
-	/* We don't want to use dispatcher - we always want to load our kernel. */
-	cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
-
-	cfg.xdp_flags = opt_xdp_flags;
-	cfg.bind_flags = opt_xdp_bind_flags;
-
-	rxr = rx ? &xsk->rx : NULL;
-	txr = tx ? &xsk->tx : NULL;
-
-	/* Save our position in xsks array and map. */
-	xsk->xsk_index = xsk_index;
-
-	/* In a multi-FCQ setup we need to store a umem offset, telling us where the umem descriptors
-	 * for this XSK are. This is so each channel does not hit the same memory space.
-	 *
-	 * Logic here is xsk[0] gets the first batch of descriptors, xsk[1] gets the next batch,
-	 * and so on. */
-
-	xsk->umem_offset = xsk_index * (NUM_FRAMES * opt_xsk_frame_size);
-
-	/* In a multi-FCQ setup, we bind to multiple channel IDs, so we calculate this via the
-	 * queue number + the xsk index. Mellanox cards will need to have --queue=n for zero copy. */
-
-	xsk->channel_id = opt_queue + xsk_index;
-	printf("opt_queue: %d\n", opt_queue);
-	printf("xsk_index: %d\n", xsk_index);
-	//xsk->channel_id = 6;
-
-	/* In a multi-FCQ setup we use the xsk_socket__create_shared() API which lets us pass
-	 * in pointers to dedicated Fill/Completion queue per XSK. */
-
-	fprintf(stdout, "Opening multi-FCQ XSK[%u] to %s channel %u...\n",
-		xsk->xsk_index, opt_if, xsk->channel_id);
-	ret = xsk_socket__create_shared(&xsk->xsk, opt_if, xsk->channel_id, umem->umem,
-	 			rxr, txr, &xsk->fq, &xsk->cq, &cfg);
-
-	// printf("xsk: %llx\n", &xsk->xsk);
-	// printf("opt_if: %s\n", opt_if);
-	// printf("xsk->channel_id: %d\n", xsk->channel_id);
-	// printf("umem->umem: %llx\n", umem->umem);
-	// printf("rxr: %llx\n", rxr);
-	// printf("txr: %llx\n", txr);
-	// printf("&xsk->fq: %llx\n", &xsk->fq);
-	// printf("&xsk->cq: %llx\n", &xsk->cq);
-	// printf("&cfg: %llx\n", &cfg);
-	// printf("ret: %d\n", ret);
+	tv_sec = (u32)(tx_ns / NSEC_PER_SEC);
+	tv_usec = (u32)((tx_ns % NSEC_PER_SEC) / 1000);
 
 
-	if (ret)
-		exit_with_error(-ret);
+	for (i = 0; i < batch_size; i++) {
+		u32 len = PKT_SIZE;
 
-	ret = bpf_xdp_query_id(opt_ifindex, opt_xdp_flags, &prog_id);
-	if (ret)
-		exit_with_error(-ret);
+		struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsks[xsk_id]->tx, idx + i);
+		tx_desc->addr = frame_nb[xsk_id] * opt_xsk_frame_size;
+		tx_desc->len = len;
+		tx_desc->options = 0;
+		xsks[xsk_id]->ring_stats.tx_npkts++;
 
-	xsk->app_stats.rx_empty_polls = 0;
-	xsk->app_stats.fill_fail_polls = 0;
-	xsk->app_stats.copy_tx_sendtos = 0;
-	xsk->app_stats.tx_wakeup_sendtos = 0;
-	xsk->app_stats.opt_polls = 0;
-	xsk->app_stats.prev_rx_empty_polls = 0;
-	xsk->app_stats.prev_fill_fail_polls = 0;
-	xsk->app_stats.prev_copy_tx_sendtos = 0;
-	xsk->app_stats.prev_tx_wakeup_sendtos = 0;
-	xsk->app_stats.prev_opt_polls = 0;
+		frame_nb[xsk_id] = (frame_nb[xsk_id] + 1) % NUM_FRAMES;
 
-	return xsk;
+		struct pktgen_hdr *pktgen_hdr;
+		u64 addr = tx_desc->addr;
+		char *pkt;
+
+		pkt = xsk_umem__get_data(xsks[xsk_id]->umem->buffer, addr);
+		pktgen_hdr = (struct pktgen_hdr *)(pkt + PKTGEN_HDR_OFFSET);
+
+		pktgen_hdr->seq_num = htonl(sequence++);
+		pktgen_hdr->tv_sec = htonl(tv_sec);
+		pktgen_hdr->tv_usec = htonl(tv_usec);
+
+		hex_dump(pkt, PKT_SIZE, addr);
+	}
+
+	xsk_ring_prod__submit(&xsks[xsk_id]->tx, batch_size);
+	xsks[xsk_id]->outstanding_tx += batch_size;
+	xsks[xsk_id]->ring_stats.tx_frags += batch_size;
+	complete_tx_only(xsks[xsk_id], batch_size);
+
+	return batch_size / frames_per_pkt;
 }
 
 
-int xdp_init(int num_of_xsks, char* interface_name)
+inline static int send_tx_array(u32 xsk_idx, struct packet_desc* tx_array, int batch_size, u32 pkt_cnt)
 {
-	struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
-	struct __user_cap_data_struct data[2] = { { 0 } };
+	u32 idx;
+	u32 frame_nb = 0;
+	unsigned int i;
+	u32 packets_done = 0;
+	struct xsk_socket_info *xsk = xsks[xsk_idx];
+	if(!pkt_cnt){
+		return 0;
+	}
+
+	while(packets_done < pkt_cnt){
+
+		if(pkt_cnt - packets_done < batch_size){
+			batch_size = pkt_cnt - packets_done;
+		}
+
+		while (xsk_ring_prod__reserve(&xsk->tx, batch_size, &idx) < batch_size) {
+			complete_tx_only(xsk, batch_size);
+		}
+
+		for (i = 0; i < batch_size; ) {
+			u32 len = tx_array[i].len;
+			hex_dump((u64*)tx_array[i].addr, len, (u64)tx_array[i].addr);
+
+			do {
+				struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, idx + i);
+				tx_desc->addr = CONVERT_TO_RELATIVE_ADDRESS(tx_array[packets_done].addr);
+				if (len > opt_xsk_frame_size) {
+					tx_desc->len = opt_xsk_frame_size;
+					tx_desc->options = XDP_PKT_CONTD;
+				} else {
+					tx_desc->len = len;
+					tx_desc->options = 0;
+					xsk->ring_stats.tx_npkts++;
+					packets_done++;
+				}
+				len -= tx_desc->len;
+				frame_nb = (frame_nb + 1) % NUM_FRAMES;
+				i++;
+			} while (len);
+		}
+		xsk_ring_prod__submit(&xsk->tx, batch_size);
+		xsk->outstanding_tx += batch_size;
+		xsk->ring_stats.tx_frags += batch_size;
+		complete_tx_release_rx(xsk);
+	}
+	return batch_size / frames_per_pkt;
+}
+
+
+void xdp_general_init(int number_of_sockets, char* interface_name, pthread_t *threads_array)
+{
+	threads=threads_array;
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
-	struct sched_param schparam;
-
-	int xsks_map_fd = 0;
-	int i, ret;
-	bool rx = true;
-	bool tx = true;
-
-	opt_if = interface_name;
-	opt_num_xsks = num_of_xsks;
-	opt_ifindex = if_nametoindex(opt_if);
-	//printf("if_nametoindex: %d\n", if_nametoindex(opt_if));
-	if (opt_reduced_cap) {
-		if (capget(&hdr, data)  < 0)
-			fprintf(stderr, "Error getting capabilities\n");
-
-		data->effective &= CAP_TO_MASK(CAP_NET_RAW);
-		data->permitted &= CAP_TO_MASK(CAP_NET_RAW);
-
-		if (capset(&hdr, data) < 0)
-			fprintf(stderr, "Setting capabilities failed\n");
-
-		if (capget(&hdr, data)  < 0) {
-			fprintf(stderr, "Error getting capabilities\n");
-		} else {
-			fprintf(stderr, "Capabilities EFF %x Caps INH %x Caps Per %x\n",
-				data[0].effective, data[0].inheritable, data[0].permitted);
-			fprintf(stderr, "Capabilities EFF %x Caps INH %x Caps Per %x\n",
-				data[1].effective, data[1].inheritable, data[1].permitted);
-		}
-	} else {
-		if (setrlimit(RLIMIT_MEMLOCK, &r)) {
-			fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
-				strerror(errno));
-			exit(EXIT_FAILURE);
-		}
-
-		if (load_xdp_prog)
-			load_xdp_program();
-	}
-
-	/* Reserve memory for the umem. Use hugepages if unaligned chunk mode */
-	bufs = mmap(NULL, (NUM_FRAMES * opt_xsk_frame_size) * opt_num_xsks,
-		    PROT_READ | PROT_WRITE,
-		    MAP_PRIVATE | MAP_ANONYMOUS | opt_mmap_flags, -1, 0);
-	if (bufs == MAP_FAILED) {
-		printf("ERROR: mmap failed\n");
-		exit(EXIT_FAILURE);
-	}
-
-	/* Create sockets... */
-	umem = xsk_configure_umem(bufs, (NUM_FRAMES * opt_xsk_frame_size) * opt_num_xsks);
-	//xsk_populate_fill_ring(umem);
-	
-	for (i = 0; i < opt_num_xsks; i++){
-		//xsks[num_socks++] = xsk_configure_socket(umem, rx, tx);
-		xsks[num_socks++] = xsk_configure_socket_multicore(umem, rx, tx, i);
-		printf("\n\n xsks = 0x%llx", xsks[i]);
-	}
-	/* In a multi-fcq setup we fill via each XSK FQ. */
-	for (i = 0; i < num_socks; i++)
-		xsk_populate_fill_ring_multicore(umem, xsks[i]);
-	for (i = 0; i < num_socks; i++)
-		apply_setsockopt(xsks[i]);
-
-	
-	frames_per_pkt = (opt_pkt_size - 1) / XSK_UMEM__DEFAULT_FRAME_SIZE + 1;
-
-	if (load_xdp_prog)
-		enter_xsks_into_map();
-
+	opt_num_xsks = number_of_sockets;
+	int ret;
 	signal(SIGINT, int_exit);
 	signal(SIGTERM, int_exit);
 	signal(SIGABRT, int_exit);
+	opt_if = interface_name;
+	opt_ifindex = if_nametoindex(opt_if);
 
-	setlocale(LC_ALL, "");
+	
+	if (setrlimit(RLIMIT_MEMLOCK, &r)) {
+		fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
+			strerror(errno));
+		exit(EXIT_FAILURE);
+	}
 
-	prev_time = get_nsecs();
-	start_time = prev_time;
+	if (load_xdp_prog)
+		load_xdp_program();
+
+	frames_per_pkt = (opt_pkt_size - 1) / XSK_UMEM__DEFAULT_FRAME_SIZE + 1;
 
 	if (!opt_quiet) {
 		ret = pthread_create(&pt, NULL, poller, NULL);
 		if (ret)
 			exit_with_error(ret);
 	}
+
+}
+
+void xdp_init_thread(int number_of_sockets, char* interface_name, int thread_id)
+{
+	bool rx = true, tx = true;
+	struct sched_param schparam;
+	int ret;
+	signal(SIGINT, int_exit);
+	signal(SIGTERM, int_exit);
+	signal(SIGABRT, int_exit);
+
+	/* Reserve memory for the umem. Use hugepages if unaligned chunk mode */
+	bufs_array[thread_id] = mmap(NULL, NUM_FRAMES * opt_xsk_frame_size,
+		    PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | opt_mmap_flags, -1, 0);
+	if (bufs_array[thread_id] == MAP_FAILED) {
+		printf("ERROR: mmap failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Create sockets... */
+	umems[thread_id] = xsk_configure_umem(bufs_array[thread_id], NUM_FRAMES * opt_xsk_frame_size);
+
+	xsk_populate_fill_ring(umems[thread_id]);
+		
+	num_socks++;
+	xsks[thread_id] = xsk_configure_socket(umems[thread_id], rx, tx, thread_id);
+	apply_setsockopt(xsks[thread_id]);
+
+	if (load_xdp_prog)
+		enter_xsks_into_map_by_index(thread_id);
+
+	setlocale(LC_ALL, "");
+
+	prev_time = get_nsecs();
+	start_time = prev_time;
 
 	/* Configure sched priority for better wake-up accuracy */
 	memset(&schparam, 0, sizeof(schparam));
@@ -1964,15 +1405,109 @@ int xdp_init(int num_of_xsks, char* interface_name)
 	}
 }
 
-int xdp_exit(){
-	//printf("\nexit\n");
-	benchmark_done = true;
 
-	if (!opt_quiet)
-		pthread_join(pt, NULL);
+void final_cleanup(){
 
-	xdpsock_cleanup();
-	munmap(bufs, (NUM_FRAMES * opt_xsk_frame_size) * opt_num_xsks);
-	return 0;
+	munmap(bufs, NUM_FRAMES * opt_xsk_frame_size);
+	if (load_xdp_prog)
+			remove_xdp_program();
+	for(int i=0; i < opt_num_xsks; i++){
+		(void)xsk_umem__delete(umems[i]->umem);
+	}
 }
 
+static u8 pkt_data[MAX_PKT_SIZE];
+
+void gen_eth_hdr_data(void)
+{
+	struct pktgen_hdr *pktgen_hdr;
+	struct udphdr *udp_hdr;
+	struct iphdr *ip_hdr;
+
+
+	struct ethhdr *eth_hdr = (struct ethhdr *)pkt_data;
+
+	udp_hdr = (struct udphdr *)(pkt_data +
+					sizeof(struct ethhdr) +
+					sizeof(struct iphdr));
+	ip_hdr = (struct iphdr *)(pkt_data +
+					sizeof(struct ethhdr));
+	pktgen_hdr = (struct pktgen_hdr *)(pkt_data +
+						sizeof(struct ethhdr) +
+						sizeof(struct iphdr) +
+						sizeof(struct udphdr));
+	/* ethernet header */
+	int opt_txdmac = 0;
+	int opt_txsmac = 0;
+
+	memcpy(eth_hdr->h_dest, &opt_txdmac, ETH_ALEN);
+	memcpy(eth_hdr->h_source, &opt_txsmac, ETH_ALEN);
+	eth_hdr->h_proto = htons(ETH_P_IP);
+
+
+	/* IP header */
+	ip_hdr->version = IPVERSION;
+	ip_hdr->ihl = 0x5; /* 20 byte header */
+	ip_hdr->tos = 0x0;
+	ip_hdr->tot_len = htons(IP_PKT_SIZE);
+	ip_hdr->id = 0;
+	ip_hdr->frag_off = 0;
+	ip_hdr->ttl = IPDEFTTL;
+	ip_hdr->protocol = IPPROTO_UDP;
+	ip_hdr->saddr = htonl(0x0a0a0a10);
+	ip_hdr->daddr = htonl(0x0a0a0a20);
+
+	/* IP header checksum */
+	ip_hdr->check = 0;
+	ip_hdr->check = ip_fast_csum((const void *)ip_hdr, ip_hdr->ihl);
+
+	/* UDP header */
+	udp_hdr->source = htons(0x1000);
+	udp_hdr->dest = htons(0x1000);
+	udp_hdr->len = htons(UDP_PKT_SIZE);
+
+	/* UDP data */
+	u32 opt_pkt_fill_pattern = 0x12345678;
+	memset32_htonl(pkt_data + PKT_HDR_SIZE, opt_pkt_fill_pattern,
+		       UDP_PKT_DATA_SIZE);
+
+	/* UDP header checksum */
+	udp_hdr->check = 0;
+	udp_hdr->check = udp_csum(ip_hdr->saddr, ip_hdr->daddr, UDP_PKT_SIZE,
+				  IPPROTO_UDP, (u16 *)udp_hdr);
+}
+
+// void gen_eth_frame(int xsk_id, int frame_number, struct packet_desc* desc_to_fill)
+// {
+// 	static u32 len;
+// 	u32 copy_len = opt_xsk_frame_size;
+// 	u64 addr = frame_number * opt_xsk_frame_size;
+
+// 	if (!len)
+// 		len = PKT_SIZE;
+
+// 	if (len < opt_xsk_frame_size)
+// 		copy_len = len;
+// 	memcpy(xsk_umem__get_data(xsks[xsk_id]->umem->buffer, xsk_umem__add_offset_to_addr(addr)),
+// 			pkt_data + PKT_SIZE - len, copy_len);
+// 	len -= copy_len;
+// 	struct packet_desc* result_desc;
+// 	desc_to_fill->addr = addr;
+// 	desc_to_fill->len = copy_len;
+// 	desc_to_fill->option = 0;
+// }
+
+void gen_eth_frame(int xsk_id, u64 addr)
+{
+	static u32 len;
+	u32 copy_len = opt_xsk_frame_size;
+
+	if (!len)
+		len = PKT_SIZE;
+
+	if (len < opt_xsk_frame_size)
+		copy_len = len;
+	memcpy(xsk_umem__get_data(umems[xsk_id]->buffer, addr),
+			pkt_data + PKT_SIZE - len, copy_len);
+	len -= copy_len;
+}
